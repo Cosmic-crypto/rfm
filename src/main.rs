@@ -1,13 +1,15 @@
-use std::fs::{File, remove_file, rename, remove_dir};
-use std::path::Path;
-use std::time::Duration;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::io::{self, Read, Write};
-use reqwest::blocking::get;
-use argh::FromArgs;
 use ansi_term::Colour::*;
+use argh::FromArgs;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::blocking::get;
+use std::fs::{remove_dir_all, remove_file, rename, File};
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-/// CLi tool to install/delete a file
+/// CLI tool to install/delete/move a file
 #[derive(FromArgs)]
 struct Args {
     /// delete mode
@@ -33,32 +35,33 @@ struct Args {
     /// url to install
     #[argh(option)]
     url: Option<String>,
-
 }
 
 fn validate(args: &Args) -> Result<(), String> {
-     match (args.install, args.delete, args.move_file) {
+    // Enforce exactly one execution mode so command intent is unambiguous.
+    match (args.install, args.delete, args.move_file) {
         (true, false, false) => {}
         (false, true, false) => {}
         (false, false, true) => {}
-
-        (false, false, false) => {
-            return Err("No action specified".to_string());
-        }
+        (false, false, false) => return Err("No action specified".to_string()),
         _ => {
-            return Err("Can only use one of --install, --delete, or --move-file at a time".to_string());
+            return Err(
+                "Can only use one of --install, --delete, or --move-file at a time".to_string(),
+            )
         }
     }
 
+    // URL is only valid for install mode.
     if (args.delete || args.move_file) && args.url.is_some() {
         return Err("delete/move mode does not take a URL".into());
     }
 
+    // Move mode requires a destination path.
     if args.move_file && args.move_to.is_none() {
         return Err("move mode requires --move-to".into());
     }
 
-
+    // Install mode requires the source URL.
     if args.install && args.url.is_none() {
         return Err("install mode requires a URL".into());
     }
@@ -67,11 +70,19 @@ fn validate(args: &Args) -> Result<(), String> {
 }
 
 fn move_file(from: &str, to: &str) -> Result<(), Box<dyn std::error::Error>> {
-    rename(from, to)
-        .map_err(|e: io::Error| format!("failed to move file: {}", e))?;
+    // Rename performs the move when source and destination are on the same filesystem.
+    if let Err(e) = rename(from, to) {
+        eprintln!(
+            "{} {}",
+            Red.paint("Error:"),
+            Red.paint(format!("failed to move file: {}", e))
+        );
+        return Err(Box::new(e));
+    }
 
+    // Keep user-facing success output colorized and explicit.
     println!(
-        "{}: Moved {} → {}",
+        "{}: Moved {} -> {}",
         Green.paint("Success"),
         Blue.paint(from),
         Yellow.paint(to)
@@ -80,17 +91,20 @@ fn move_file(from: &str, to: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 fn install(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut response = get(url)?;
+    let mut response: reqwest::blocking::Response = get(url)?;
+    let content_length: Option<u64> = response.content_length();
 
-    // Decide which indicator to use
-    let pb: ProgressBar = match response.content_length() {
+    // =========================
+    // Progress Bar
+    // =========================
+    let pb: ProgressBar = match content_length {
         Some(size) => {
             let pb: ProgressBar = ProgressBar::new(size);
             pb.set_style(
                 ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                    "{spinner:.green} [{elapsed_precise}] \
+                     [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
                 )?
                 .progress_chars("#>-"),
             );
@@ -99,7 +113,9 @@ fn install(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         None => {
             let pb: ProgressBar = ProgressBar::new_spinner();
             pb.set_style(
-                ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {msg}")?,
+                ProgressStyle::with_template(
+                    "{spinner:.green} {elapsed_precise} {msg}"
+                )?,
             );
             pb.set_message("Downloading...");
             pb.enable_steady_tick(Duration::from_millis(100));
@@ -107,22 +123,84 @@ fn install(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut file: File = File::create(path)?;
-    let mut downloaded: u64 = 0;
-    let mut buffer: [u8; 8192] = [0u8; 8192];
+    // =========================
+    // Shared State
+    // =========================
+    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let finished: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let downloaded: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
 
-    loop {
-        let n: usize = response.read(&mut buffer)?;
-        if n == 0 {
-            break;
+    // =========================
+    // READER THREAD
+    // =========================
+    let buffer_reader = Arc::clone(&buffer);
+    let finished_reader = Arc::clone(&finished);
+    let downloaded_reader = Arc::clone(&downloaded);
+
+    let reader: thread::JoinHandle<Result<(), Box<dyn Error + 'static>>> = thread::spawn(move || -> Result<(), Box<dyn std::error::Error>> {
+        let mut local: [u8; 8192] = [0u8; 8192];
+
+        loop {
+            let n: usize = response.read(&mut local)?;
+            if n == 0 {
+                break;
+            }
+
+            {
+                let mut shared = buffer_reader.lock().unwrap();
+                shared.extend_from_slice(&local[..n]);
+            }
+
+            {
+                let mut d = downloaded_reader.lock().unwrap();
+                *d += n as u64;
+            }
         }
 
-        file.write_all(&buffer[..n])?;
-        downloaded += n as u64;
+        let mut done = finished_reader.lock().unwrap();
+        *done = true;
 
-        // Only updates position if this is a real progress bar
-        pb.set_position(downloaded);
-    }
+        Ok(())
+    });
+
+    // =========================
+    // WRITER THREAD
+    // =========================
+    let buffer_writer = Arc::clone(&buffer);
+    let finished_writer = Arc::clone(&finished);
+    let downloaded_writer = Arc::clone(&downloaded);
+    let pb_writer: ProgressBar = pb.clone();
+    let path_string: String = path.to_string();
+
+    let writer: thread::JoinHandle<Result<(), Box<dyn Error + 'static>>> = thread::spawn(move || -> Result<(), Box<dyn std::error::Error>> {
+        let mut file: File = File::create(path_string)?;
+
+        loop {
+            {
+                let mut shared: [u8] = buffer_writer.lock().unwrap();
+                if !shared.is_empty() {
+                    file.write_all(&shared)?;
+                    shared.clear();
+                }
+            }
+
+            {
+                let d = downloaded_writer.lock().unwrap();
+                pb_writer.set_position(*d);
+            }
+
+            if *finished_writer.lock().unwrap() {
+                break;
+            }
+
+            thread::yield_now();
+        }
+
+        Ok(())
+    });
+
+    reader.join().unwrap()?;
+    writer.join().unwrap()?;
 
     pb.finish_with_message("Download complete");
 
@@ -136,69 +214,79 @@ fn install(url: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn uninstall(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path: &Path = Path::new(&path);
 
-    if path.exists() {
-        if path.is_file() {
-            remove_file(path)?;
-        } else {
-            remove_dir(path)?;
-        }
-    } else {
-        println!(
+fn uninstall(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Convert user input into a Path for filesystem checks and operations.
+    let path: &Path = Path::new(path);
+
+    // Fail fast with a colorized message when the target does not exist.
+    if !path.exists() {
+        eprintln!(
             "{} path: {} does {} exist",
-            Red.paint("Error"), Yellow.paint(format!("{:#?}", path)), Red.paint("not")
+            Red.paint("Error:"),
+            Yellow.paint(format!("{:#?}", path)),
+            Red.paint("not")
         );
+        return Err(io::Error::new(io::ErrorKind::NotFound, "path does not exist").into());
     }
 
-    println!(
-        "{}: Uninstalled path: {:#?}",
-        Green.paint("Success"), path
-    );
+    // Remove files directly; remove directories recursively.
+    if path.is_file() {
+        remove_file(path)?;
+    } else {
+        remove_dir_all(path)?;
+    }
+
+    // Report successful deletion with the resolved path.
+    println!("{}: Uninstalled path: {:#?}", Green.paint("Success"), path);
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse CLI arguments once at startup.
     let args: Args = argh::from_env();
-    validate(&args)?;
 
+    // Validate mode/argument combinations before any filesystem or network action.
+    if let Err(e) = validate(&args) {
+        eprintln!("{} {}", Red.paint("Error:"), Red.paint(format!("{:#?}", e)));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, e).into());
+    }
+
+    // Install branch: download from URL to target path.
     if args.install {
-        let url: &str = args.url.as_ref().expect("install requires a URL");
-        let err: Result<(), Box<dyn std::error::Error>> = install(&url, &args.path);
-
-        if let Err(e) = err {
+        let url: &str = args.url.as_deref().expect("install requires a URL");
+        if let Err(e) = install(url, &args.path) {
             eprintln!("{}", Red.paint(format!("Error: {:#?}", e)));
+            return Err(e);
         }
-
+    // Delete branch: explicit confirmation guard before destructive action.
     } else if args.delete {
         println!(
             "{}: This command will remove the following file: {}\nAre you sure you want to continue (y/n)?",
-            Red.paint("WARNING"), args.path
+            Red.paint("WARNING"),
+            args.path
         );
-        let mut confirmation: String = String::new();
-        io::stdin()
-            .read_line(&mut confirmation)
-            .expect("Please enter a valid response (y/n)");
 
-        confirmation = confirmation.trim().to_lowercase();
+        // Normalize user confirmation to make matching case-insensitive.
+        let mut confirmation: String = String::new();
+        io::stdin().read_line(&mut confirmation)?;
+        let confirmation: String = confirmation.trim().to_lowercase();
 
         if confirmation == "n" || confirmation == "no" {
             println!("Safely exiting");
             return Ok(());
         }
 
-        let err: Result<(), Box<dyn std::error::Error>> = uninstall(&args.path);
-
-        if let Err(e) = err {
+        if let Err(e) = uninstall(&args.path) {
             eprintln!("{}", Red.paint(format!("Error: {:#?}", e)));
+            return Err(e);
         }
-
+    // Move branch: relocate file to provided destination.
     } else {
-        let err: Result<(), Box<dyn std::error::Error>> = move_file(&args.path, &args.move_to.unwrap());
-
-        if let Err(e) = err {
+        let move_to: &str = args.move_to.as_deref().expect("move mode requires --move-to");
+        if let Err(e) = move_file(&args.path, move_to) {
             eprintln!("{}", Red.paint(format!("Error: {:#?}", e)));
+            return Err(e);
         }
     }
 
